@@ -1,119 +1,117 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-import openai
-import os
+from django.core.files.storage import FileSystemStorage
 from dotenv import load_dotenv
-from django.http import HttpResponse
+from .models import Quiz, StudentProgress
+
+import openai
+import logging
+import os
+import random
 import cv2
 import pytesseract
-from django.http import JsonResponse
-from django.core.files.storage import FileSystemStorage
-import random
 
-def generate_quiz(request):
-    quizzes = Quiz.objects.all()
-    quiz = random.choice(quizzes)
-    
-    options = quiz.options.split(',')
-    random.shuffle(options)
-    
-    return JsonResponse({
-        'question': quiz.question,
-        'options': options,
-        'correct_answer': quiz.correct_answer
-def scan_notes(request):
-    if request.method == 'POST' and request.FILES['file']:
-        uploaded_file = request.FILES['file']
-        fs = FileSystemStorage()
-        filename = fs.save(uploaded_file.name, uploaded_file)
-        file_url = fs.url(filename)
-        
-        img = cv2.imread(file_url)
-        text = pytesseract.image_to_string(img)
-        
-        return JsonResponse({'scanned_text': text})
-    return JsonResponse({'error': 'No file uploaded'}, status=400)
+# Set up logging
+logger = logging.getLogger(__name__)
 
-openai.api_key = 'your_openai_api_key'
-
-def chatbot_query(request):
-    question = request.GET.get('question', '')
-    if not question:
-        return JsonResponse({'error': 'No question provided'}, status=400)
-    
-    response = openai.Completion.create(
-        engine="text-davinci-003",
-        prompt=question,
-        max_tokens=100
-    )
-    
-    return JsonResponse({'response': response.choices[0].text.strip()})
-
-def test_chatbot(request):
-    question = request.GET.get('question')  # Get the question from the query parameters
-    
-    if not question:
-        return JsonResponse({"error": "No question provided"}, status=400)  # Return error if no question is provided
-    
-    # Process the question (you can call your chatbot logic here)
-    response = "This is a mock response to your question: " + question
-    
-    return JsonResponse({"response": response})
-
+# Load environment variables
 load_dotenv()
-
-# Set OpenAI API key from environment variable
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-@api_view(['GET', 'POST'])  # Accept both GET and POST requests
+@api_view(['POST'])
 def ask_gpt(request):
-    if request.method == 'POST':
-        # Handle POST request
-        user_question = request.data.get('question')
+    """
+    Endpoint to ask GPT a question using OpenAI API.
+    Accepts POST requests with a 'question' parameter.
+    """
+    user_question = request.data.get('question')
+    if not user_question:
+        return Response({'error': 'Please provide a question.'}, status=400)
 
-        if not user_question:
-            return Response({'error': 'Please provide a question.'}, status=400)
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "system", "content": "You are a helpful AI tutor named LearnAI."},
+                      {"role": "user", "content": user_question}]
+        )
+        answer = response.choices[0].message['content'].strip()
+        return Response({'answer': answer})
+    except Exception as e:
+        logger.error(f"Error in ask_gpt: {str(e)}")
+        return Response({'error': 'An error occurred while processing the question.'}, status=500)
 
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful AI tutor named LearnAI."},
-                    {"role": "user", "content": user_question},
-                ]
-            )
-            answer = response.choices[0].message['content'].strip()
-            return Response({'answer': answer})
 
-        except Exception as e:
-            return Response({'error': str(e)}, status=500)
+@api_view(['GET'])
+def generate_quiz(request):
+    """
+    Endpoint to generate a random quiz from the database.
+    """
+    try:
+        quizzes = Quiz.objects.all()
+        if not quizzes.exists():
+            return Response({'error': 'No quizzes available'}, status=404)
 
-    elif request.method == 'GET':
-        # Handle GET request
-        user_question = request.GET.get('question', '')
+        quiz = random.choice(quizzes)
+        options = quiz.options.split(',')
+        random.shuffle(options)
 
-        if user_question:
-            try:
-                response = openai.Completion.create(
-                    model="text-davinci-003",  # You can change the model if needed
-                    prompt=user_question,
-                    max_tokens=150
-                )
-                answer = response.choices[0].text.strip()
-                return JsonResponse({'answer': answer})
-            except Exception as e:
-                return JsonResponse({'error': str(e)}, status=500)
-        else:
-            return JsonResponse({'error': 'No question provided'}, status=400)
+        return Response({
+            'question': quiz.question,
+            'options': options,
+            'correct_answer': quiz.correct_answer
+        })
+    except Exception as e:
+        logger.error(f"Error in generate_quiz: {str(e)}")
+        return Response({'error': 'An error occurred while generating the quiz.'}, status=500)
+
+
+@api_view(['POST'])
+def scan_notes(request):
+    """
+    Endpoint to scan an image containing handwritten notes and extract text.
+    """
+    if 'file' not in request.FILES:
+        return Response({'error': 'No file uploaded'}, status=400)
+
+    uploaded_file = request.FILES['file']
+    if not uploaded_file.name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+        return Response({'error': 'Invalid file type. Please upload an image.'}, status=400)
+
+    try:
+        fs = FileSystemStorage()
+        filename = fs.save(uploaded_file.name, uploaded_file)
+        file_path = os.path.join(fs.location, filename)
+
+        img = cv2.imread(file_path)
+        text = pytesseract.image_to_string(img)
+
+        fs.delete(filename)  # Clean up the file
+        return Response({'scanned_text': text})
+    except Exception as e:
+        logger.error(f"Error in scan_notes: {str(e)}")
+        return Response({'error': 'An error occurred while processing the image.'}, status=500)
 
 
 def award_points(user, points):
-    progress, created = StudentProgress.objects.get_or_create(user=user)
-    progress.points += points
-    progress.save()
+    """
+    Function to award points to a user.
+    """
+    try:
+        progress, _ = StudentProgress.objects.get_or_create(user=user)
+        progress.points += points
+        progress.save()
+    except Exception as e:
+        logger.error(f"Error in award_points: {str(e)}")
+
 
 def award_badge(user, badge):
-    progress, created = StudentProgress.objects.get_or_create(user=user)
-    if badge not in progress.badges:
-        progress.badges += f", {badge}"
-        progress.save()
+    """
+    Function to award a badge to a user.
+    """
+    try:
+        progress, _ = StudentProgress.objects.get_or_create(user=user)
+        if badge not in progress.badges:
+            progress.badges += f", {badge}"
+            progress.save()
+    except Exception as e:
+        logger.error(f"Error in award_badge: {str(e)}")
